@@ -1,58 +1,76 @@
 import os
 import asyncio
-from aiogram import Bot, Dispatcher, types
+import logging
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.types import Message
+import asyncpg
 
-# گرفتن توکن و لیست ادمین‌ها از متغیرهای محیطی
-TOKEN = os.getenv("BOT_TOKEN")
-ADMINS_ENV = os.getenv("ADMIN_IDS", "")  # مثال: "123456789,987654321"
+logging.basicConfig(level=logging.INFO)
 
-# تبدیل رشته ادمین‌ها به مجموعه‌ای از اعداد
-ADMIN_IDS = set()
-for part in [p.strip() for p in ADMINS_ENV.split(",") if p.strip()]:
-    try:
-        ADMIN_IDS.add(int(part))
-    except ValueError:
-        print(f"⚠️ مقدار ادمین غیرمجاز: {part}")
+# --- Bot setup ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is not set")
-
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# دستور پنل مدیریت
+# --- Database connection pool ---
+async def get_pool():
+    return await asyncpg.create_pool(DATABASE_URL)
+
+# --- Commands ---
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("✅ Bot is on!")
+
 @dp.message(Command("admin"))
-async def admin_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+async def cmd_admin(message: Message):
+    if str(message.from_user.id) == ADMIN_ID:
+        await message.answer("✅ You are admin!")
+    else:
+        await message.answer("⛔ شما دسترسی ندارید")
+
+# --- Init DB command ---
+@dp.message(Command("initdb"))
+async def init_db_cmd(message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
         await message.answer("⛔ شما دسترسی ندارید")
         return
 
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="تنظیم تایمر ⏱")
-    kb.button(text="ارسال لینک 🎥")
-    kb.adjust(2)
+    CREATE_TABLES = """
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE NOT NULL,
+        username TEXT,
+        joined_at TIMESTAMP DEFAULT NOW()
+    );
 
-    await message.answer("📌 پنل مدیریت:", reply_markup=kb.as_markup(resize_keyboard=True))
+    CREATE TABLE IF NOT EXISTS links (
+        id SERIAL PRIMARY KEY,
+        url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        expires_in INTEGER DEFAULT 20
+    );
 
-# پیام پیش‌فرض
-@dp.message()
-async def echo(message: types.Message):
-    await message.answer("✅ Bot is on!")
+    CREATE TABLE IF NOT EXISTS settings (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        value TEXT NOT NULL
+    );
+    """
 
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(CREATE_TABLES)
+
+    await message.answer("✅ جداول با موفقیت ساخته شدند")
+
+# --- Run bot ---
 async def main():
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    logging.info("🤖 Bot started")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("🟢 ربات روشن شد")
-    print("🛠️ بررسی ادمین‌ها:")
-    print("ADMIN_IDS از ENV:", ADMIN_IDS)
-    if ADMIN_IDS:
-        print("✅ حداقل یک ادمین شناسایی شد")
-    else:
-        print("❌ هیچ ادمینی شناسایی نشده")
     asyncio.run(main())
