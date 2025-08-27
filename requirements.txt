@@ -1,2 +1,6 @@
 aiogram==3.10.0
 aiohttp
+asyncpg
+cryptography
+python-dotenv
+httpx
