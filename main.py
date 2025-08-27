@@ -4,14 +4,15 @@ import asyncio
 import hmac
 import hashlib
 import logging
-import json
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
+
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.client.default import DefaultBotProperties
 
 # ----------------------------
 # Logging
@@ -28,14 +29,16 @@ ADMIN_IDS = set()
 for p in [x.strip() for x in ADMIN_IDS_ENV.split(",") if x.strip()]:
     try:
         ADMIN_IDS.add(int(p))
-    except:
+    except Exception:
         pass
 
 STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0"))
-DEFAULT_REQUIRED_CHANNEL_IDS = [int(x) for x in os.getenv("DEFAULT_REQUIRED_CHANNEL_IDS", "").split(",") if x.strip()]
+DEFAULT_REQUIRED_CHANNEL_IDS = [
+    int(x) for x in os.getenv("DEFAULT_REQUIRED_CHANNEL_IDS", "").split(",") if x.strip()
+]
 DATABASE_URL = os.getenv("DATABASE_URL")
 TOKEN_SECRET = os.getenv("TOKEN_SECRET", os.getenv("JWT_SECRET", "change_this_secret"))
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", ""))  # try multiple fallbacks
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", os.getenv("RENDER_EXTERNAL_HOSTNAME", ""))
 
 DEFAULT_DELETE_TIMEOUT = int(os.getenv("DELETE_TIMEOUT_DEFAULT", os.getenv("DELETE_TIMEOUT", "20")))
 RATE_LIMIT_COUNT = int(os.getenv("RATE_LIMIT_COUNT", "6"))
@@ -43,16 +46,10 @@ RATE_LIMIT_PERIOD = int(os.getenv("RATE_LIMIT_PERIOD", "60"))  # seconds
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required in env")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required in env")
-
-if not STORAGE_CHANNEL_ID:
-    log.warning("STORAGE_CHANNEL_ID not set or zero — channel_post handling will be inactive until set.")
-
 if not WEBHOOK_BASE_URL:
-    log.warning("WEBHOOK_BASE_URL not set — webhook might not be configured correctly on startup.")
-
+    log.warning("WEBHOOK_BASE_URL/RENDER_EXTERNAL_HOSTNAME not set — set_webhook may fail.")
 
 # ----------------------------
 # DB (asyncpg pool)
@@ -65,8 +62,9 @@ async def get_db_pool():
         _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     return _db_pool
 
-# helper DB functions (assume tables created via SQL)
-async def insert_file_record(storage_chat_id:int, storage_message_id:int, file_unique_id:str, file_type:str, file_size:int, token:str, required_channels:List[int]=None):
+async def insert_file_record(storage_chat_id:int, storage_message_id:int,
+                             file_unique_id:str, file_type:str, file_size:int,
+                             token:str, required_channels:List[int]=None):
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -120,46 +118,44 @@ async def get_setting(key:str, default:Optional[str]=None):
 async def set_setting(key:str, value:str):
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", key, value)
-
+        await conn.execute("""
+            INSERT INTO settings(key,value) VALUES($1,$2)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        """, key, value)
 
 # ----------------------------
 # Bot & Dispatcher & Webhook
 # ----------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher()
 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH if WEBHOOK_BASE_URL else None
+WEBHOOK_URL = f"https://{WEBHOOK_BASE_URL.strip('/')}{WEBHOOK_PATH}" if not WEBHOOK_BASE_URL.startswith("http") \
+              else WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
 
 # ----------------------------
-# Utilities: secure token generation
+# Utilities
 # ----------------------------
 def make_token(file_unique_id: str) -> str:
-    # HMAC-SHA256 over file_unique_id + nonce, truncated
+    # HMAC-SHA256(file_unique_id + nonce) -> hex[:36]
     nonce = os.urandom(12)
-    hm = hmac.new(TOKEN_SECRET.encode(), file_unique_id.encode() + nonce, hashlib.sha256).hexdigest()
-    # use base62-like by hex shortening (safe & URL-friendly)
-    return hm[:36]  # 36 hex chars ~ 18 bytes
+    digest = hmac.new(TOKEN_SECRET.encode(), file_unique_id.encode() + nonce, hashlib.sha256).hexdigest()
+    return digest[:36]
 
-# ----------------------------
-# Rate-limiter (in-memory, simple)
-# ----------------------------
-_rate_map: Dict[int, List[float]] = {}  # user_id -> timestamps
+_rate_map: Dict[int, List[float]] = {}
 
 def is_rate_limited(user_id: int) -> bool:
     now_ts = time.time()
     lst = _rate_map.get(user_id, [])
-    # remove old
     window_start = now_ts - RATE_LIMIT_PERIOD
     lst = [t for t in lst if t >= window_start]
     lst.append(now_ts)
     _rate_map[user_id] = lst
     return len(lst) > RATE_LIMIT_COUNT
 
-# ----------------------------
-# Helper: safe send with forbidden handling
-# ----------------------------
 async def safe_send_message(user_id:int, text:str, **kwargs):
     try:
         return await bot.send_message(user_id, text, **kwargs)
@@ -168,24 +164,18 @@ async def safe_send_message(user_id:int, text:str, **kwargs):
         return None
 
 # ----------------------------
-# Handlers: channel_post processing (create token automatically)
+# Channel post → auto-link
 # ----------------------------
 async def process_channel_post(update: dict):
-    # Called when webhook receives channel_post update. Expects native update JSON.
     cp = update.get("channel_post")
     if not cp:
         return
     chat = cp.get("chat", {})
     chat_id = int(chat.get("id"))
-    if STORAGE_CHANNEL_ID == 0:
-        log.warning("STORAGE_CHANNEL_ID is not configured; ignoring channel_post.")
-        return
-    if chat_id != STORAGE_CHANNEL_ID:
-        # ignore posts from other channels
+    if STORAGE_CHANNEL_ID == 0 or chat_id != STORAGE_CHANNEL_ID:
         return
 
     message_id = cp.get("message_id")
-    # find file object
     file_obj = None
     file_type = None
     file_size = None
@@ -201,168 +191,176 @@ async def process_channel_post(update: dict):
 
     file_unique_id = file_obj.get("file_unique_id")
     token = make_token(file_unique_id)
+
     try:
-        file_db_id = await insert_file_record(storage_chat_id=chat_id, storage_message_id=message_id,
-                                              file_unique_id=file_unique_id, file_type=file_type, file_size=file_size,
-                                              token=token, required_channels=DEFAULT_REQUIRED_CHANNEL_IDS)
+        file_db_id = await insert_file_record(
+            storage_chat_id=chat_id,
+            storage_message_id=message_id,
+            file_unique_id=file_unique_id,
+            file_type=file_type,
+            file_size=file_size or 0,
+            token=token,
+            required_channels=DEFAULT_REQUIRED_CHANNEL_IDS
+        )
+        log.info("Inserted file id=%s token=%s", file_db_id, token)
     except Exception as e:
         log.exception("DB insert_file_record failed: %s", e)
         return
 
-    # Compose deep link for admin
     me = await bot.get_me()
     deep_link = f"t.me/{me.username}?start={token}"
-    text = f"🎬 ویدیوی جدید در کانال ذخیره ثبت شد.\nToken: <code>{token}</code>\nDeep link: {deep_link}\n\nبرای ارسال به کاربران از طریق این لینک استفاده کنید."
+    text = (
+        "🎬 ویدیوی جدید ثبت شد.\n"
+        f"Token: <code>{token}</code>\nDeep link: {deep_link}\n"
+        "برای اشتراک‌گذاری از این لینک استفاده کنید."
+    )
     for admin in ADMIN_IDS:
-        try:
-            await safe_send_message(admin, text)
-        except Exception as e:
-            log.warning("notify admin failed %s: %s", admin, e)
+        await safe_send_message(admin, text)
 
 # ----------------------------
-# Handler: start deep link
+# Start handler (deep-link)
 # ----------------------------
-class SimpleMsg:
-    """Light wrapper to mimic parts of aiogram.types.Message for handle_start logic."""
-    def __init__(self, user_dict, chat_dict, text, message_id):
-        class U: pass
-        self.from_user = U()
-        self.from_user.id = user_dict.get("id")
-        self.from_user.username = user_dict.get("username")
-        self.from_user.first_name = user_dict.get("first_name")
-        self.from_user.last_name = user_dict.get("last_name")
-        self.chat = chat_dict
-        self.text = text
-        self.message_id = message_id
+async def handle_start_with_token(msg: types.Message, token: str):
+    uid = msg.from_user.id
 
-    async def answer(self, text, **kwargs):
-        return await safe_send_message(self.from_user.id, text, **kwargs)
-
-async def handle_start_msg_wrapper(user_dict, chat_dict, token):
-    # create a SimpleMsg and call handle_start_message
-    sm = SimpleMsg(user_dict, chat_dict, f"/start {token}", None)
-    await handle_start_message(sm, token)
-
-async def handle_start_message(message: SimpleMsg, token: str):
-    user = message.from_user
-    uid = int(user.id)
-    # rate limit
     if is_rate_limited(uid):
-        await message.answer("⛔ در حال حاضر درخواست‌های زیادی از شما ثبت شده — لطفا بعدا تلاش کنید.")
+        await msg.answer("⛔ درخواست‌های زیاد؛ لطفاً کمی بعد تلاش کنید.")
         return
 
-    await upsert_user(uid, getattr(user, "username", None), getattr(user, "first_name", None), getattr(user, "last_name", None))
+    await upsert_user(
+        uid,
+        msg.from_user.username,
+        msg.from_user.first_name,
+        msg.from_user.last_name
+    )
 
     row = await get_file_by_token(token)
     if not row:
-        await message.answer("❌ لینک نامعتبر یا منقضی شده.")
+        await msg.answer("❌ لینک نامعتبر یا غیرفعال است.")
         return
 
-    # membership checks
+    # Membership checks
     req_channels = row.get("required_channels") or []
     for ch in req_channels:
         try:
             member = await bot.get_chat_member(int(ch), uid)
             if member.status in ("left", "kicked"):
-                # ask to join
                 try:
                     ch_info = await bot.get_chat(int(ch))
-                    join_url = f"https://t.me/{ch_info.username}" if getattr(ch_info, "username", None) else f"https://t.me/c/{str(ch)[4:]}"
-                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton("عضو شدن", url=join_url)]])
-                    await message.answer("برای دیدن این ویدیو باید ابتدا عضو کانال شوید.", reply_markup=kb)
+                    if getattr(ch_info, "username", None):
+                        join_url = f"https://t.me/{ch_info.username}"
+                    else:
+                        # private channel: t.me/c/<id-without -100>
+                        join_url = f"https://t.me/c/{str(ch)[4:]}"
                 except Exception:
-                    await message.answer("برای دیدن این ویدیو باید ابتدا عضو کانال شوید.")
+                    join_url = "https://t.me/"
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton("عضو شدن", url=join_url)]]
+                )
+                await msg.answer("برای دریافت فایل باید عضو کانال شوید.", reply_markup=kb)
                 return
         except Exception as e:
             log.warning("get_chat_member failed: %s", e)
-            await message.answer("خطا در بررسی عضویت — لطفا بعدا تلاش کنید.")
+            await msg.answer("خطا در بررسی عضویت — بعداً تلاش کنید.")
             return
 
-    # forward message
-    storage_chat_id = row['storage_chat_id']
-    storage_message_id = row['storage_message_id']
+    # Forward
     try:
-        forwarded = await bot.forward_message(chat_id=uid, from_chat_id=storage_chat_id, message_id=storage_message_id)
+        forwarded = await bot.forward_message(
+            chat_id=uid,
+            from_chat_id=row['storage_chat_id'],
+            message_id=row['storage_message_id']
+        )
     except Exception as e:
         log.exception("forward failed: %s", e)
-        await message.answer("خطا در ارسال فایل.")
+        await msg.answer("خطا در ارسال فایل.")
         return
 
-    # send warning
+    # Warning + schedule deletion
     timeout_setting = await get_setting('delete_timeout_seconds', str(DEFAULT_DELETE_TIMEOUT))
     try:
         timeout = int(timeout_setting)
-    except:
+    except Exception:
         timeout = DEFAULT_DELETE_TIMEOUT
 
-    warning = await bot.send_message(uid, f"⚠️ این پیام و فایل بعد از {timeout} ثانیه حذف خواهد شد. سریعاً سیو یا فوروارد کنید.")
-    # record delivery and increment views
+    warning = await msg.answer(
+        f"⚠️ این پیام و فایل پس از {timeout} ثانیه حذف می‌شود. سریعاً ذخیره یا فوروارد کنید."
+    )
+
     delivery_id = await record_delivery(row['id'], uid, forwarded.message_id if forwarded else None)
     await increment_file_views(row['id'])
 
-    # schedule delete async (non-blocking)
-    async def do_delete(delivery_id_local, chat_id_local, forwarded_msg_id, warning_msg_id, delay):
-        await asyncio.sleep(delay)
+    async def do_delete():
+        await asyncio.sleep(timeout)
         try:
-            if forwarded_msg_id:
-                await bot.delete_message(chat_id_local, forwarded_msg_id)
+            if forwarded:
+                await bot.delete_message(uid, forwarded.message_id)
         except Exception as e:
             log.warning("delete forwarded failed: %s", e)
         try:
-            await bot.delete_message(chat_id_local, warning_msg_id)
+            await bot.delete_message(uid, warning.message_id)
         except Exception as e:
             log.warning("delete warning failed: %s", e)
         try:
-            await mark_delivery_deleted(delivery_id_local)
+            await mark_delivery_deleted(delivery_id)
         except Exception as e:
             log.warning("mark_delivery_deleted failed: %s", e)
 
-    asyncio.create_task(do_delete(delivery_id, uid, forwarded.message_id if forwarded else None, warning.message_id, timeout))
+    asyncio.create_task(do_delete())
 
 # ----------------------------
-# Admin panel (simple inline callbacks)
+# Admin panel (basic)
 # ----------------------------
 async def send_admin_panel(chat_id:int):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("لیست لینک‌ها", callback_data="admin:list_links")],
         [InlineKeyboardButton("تنظیم تایمر حذف", callback_data="admin:set_timer")],
         [InlineKeyboardButton("ارسال پیام همگانی", callback_data="admin:broadcast")],
-        [InlineKeyboardButton("غیرفعال/فعال لینک", callback_data="admin:toggle_link")],
+        [InlineKeyboardButton("غیرفعال/فعال‌سازی لینک", callback_data="admin:toggle_link")],
     ])
     await safe_send_message(chat_id, "📌 پنل مدیریت:", reply_markup=kb)
 
-# helper: list links
 async def admin_list_links(chat_id:int):
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, token, created_at, views, active FROM files ORDER BY created_at DESC LIMIT 200")
+        rows = await conn.fetch("""
+            SELECT id, token, created_at, views, active
+            FROM files
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
     if not rows:
-        await safe_send_message(chat_id, "هیچ لینکی ثبت نشده است.")
+        await safe_send_message(chat_id, "هیچ لینکی ثبت نشده.")
         return
-    texts = []
+    parts = []
     for r in rows:
-        texts.append(f"ID: {r['id']}  token: <code>{r['token']}</code>\nviews: {r['views']} active: {r['active']}\n---")
-    # send as chunks
-    chunk = "\n\n".join(texts[:30])
-    await safe_send_message(chat_id, chunk, parse_mode="HTML")
+        parts.append(
+            f"ID: {r['id']}  token: <code>{r['token']}</code>\n"
+            f"views: {r['views']}  active: {r['active']}\n—"
+        )
+    # ارسال در یک پیام (اگر خیلی طولانی شد تلگرام قطع می‌کند؛ برای شروع کافیه)
+    txt = "\n".join(parts)
+    if len(txt) > 3800:
+        txt = txt[:3800] + "\n…"
+    await safe_send_message(chat_id, txt)
 
 # ----------------------------
-# aiogram message handlers (simple entrypoints for commands)
+# Aiogram handlers
 # ----------------------------
 @dp.message()
-async def generic_message_handler(msg: types.Message):
+async def all_messages(msg: types.Message):
     text = (msg.text or "").strip()
     uid = msg.from_user.id
+
     # /start with token
     if text.startswith("/start"):
-        parts = text.split()
-        if len(parts) >= 2:
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
             token = parts[1].strip()
-            await handle_start_message(msg, token)
+            await handle_start_with_token(msg, token)
             return
-        else:
-            await msg.answer("سلام! برای استفاده از لینک‌ها روی لینک‌ها کلیک کنید.")
-            return
+        await msg.answer("سلام! برای دریافت فایل‌ها از لینک‌های اختصاصی استفاده کنید.")
+        return
 
     if text.startswith("/admin"):
         if uid not in ADMIN_IDS:
@@ -371,92 +369,76 @@ async def generic_message_handler(msg: types.Message):
         await send_admin_panel(uid)
         return
 
-    # other simple commands
     if text.startswith("/help"):
-        await msg.answer("دستورات: /start <token> و پنل ادمین /admin (برای ادمین‌ها)")
+        await msg.answer("دستورات: /start <token> ، /admin (فقط ادمین)")
         return
 
-    # fallback
     await msg.answer("✅ Bot is on!")
 
-# ----------------------------
-# Callback query handling for admin actions
-# ----------------------------
 @dp.callback_query()
-async def callbacks_handler(cq: types.CallbackQuery):
-    data = cq.data or ""
-    uid = cq.from_user.id
-    if uid not in ADMIN_IDS:
+async def admin_callbacks(cq: types.CallbackQuery):
+    if cq.from_user.id not in ADMIN_IDS:
         await cq.answer("⛔ دسترسی ندارید", show_alert=True)
         return
-
+    data = cq.data or ""
     if data == "admin:list_links":
-        await admin_list_links(uid)
+        await admin_list_links(cq.from_user.id)
         await cq.answer()
         return
     if data == "admin:set_timer":
-        await cq.answer("ارسال کنید: عدد ثانیه جدید (مثال: 30)", show_alert=True)
-        # next message from admin should be processed - a simple implementation below
+        await cq.answer("عدد ثانیه جدید را ارسال کنید (مثال: 20).", show_alert=True)
         return
     if data == "admin:broadcast":
-        await cq.answer("برای ارسال همگانی، پیام را همینجا بصورت reply به من بفرستید.", show_alert=True)
+        await cq.answer("پیام همگانی را به‌صورت Reply روی همین پیام بفرستید.", show_alert=True)
+        return
+    if data == "admin:toggle_link":
+        await cq.answer("فعلاً در نسخه بعدی فعال می‌شود.", show_alert=True)
         return
     await cq.answer()
 
 # ----------------------------
-# Webhook / HTTP server entrypoints
+# Webhook server
 # ----------------------------
 app = web.Application()
 
-# Register aiogram webhook handler
+# مسیر وبهوک اصلی برای Aiogram
 SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
 setup_application(app, dp, bot=bot)
 
-# Health route
-async def health(request):
-    return web.json_response({"status":"ok"})
-
+# Health check
+async def health(_):
+    return web.json_response({"status": "ok"})
 app.router.add_get("/health", health)
 
-# Manual endpoint to accept raw telegram update (safe fallback)
+# پذیرش مستقیم JSON خام (برای تست دستی اگر نیاز شد)
 async def raw_update(request):
     try:
         data = await request.json()
-    except:
+    except Exception:
         return web.Response(status=400, text="invalid json")
-    # process channel_post quickly
+    # اگر از این مسیر برای تست استفاده شد:
     if "channel_post" in data:
         asyncio.create_task(process_channel_post(data))
-    # messages: if /start <token> we can forward to handle_start_message wrapper
-    if "message" in data:
-        msg = data["message"]
-        text = msg.get("text","")
-        if text.startswith("/start"):
-            parts = text.split()
-            if len(parts) >= 2:
-                token = parts[1]
-                asyncio.create_task(handle_start_msg_wrapper(msg.get("from",{}), msg.get("chat",{}), token))
     return web.json_response({"ok": True})
-
 app.router.add_post("/raw_update", raw_update)
 
 # ----------------------------
 # Startup / Shutdown
 # ----------------------------
-async def on_startup(app):
+async def on_startup(_app):
     log.info("Starting up: init DB pool")
     await get_db_pool()
-    # set webhook
-    if WEBHOOK_URL:
-        try:
-            await bot.set_webhook(WEBHOOK_URL, allowed_updates=["message","channel_post","callback_query","chat_member"])
-            log.info("Webhook set: %s", WEBHOOK_URL)
-        except Exception as e:
-            log.exception("Failed to set webhook: %s", e)
-    else:
-        log.warning("WEBHOOK_URL not configured; skipping set_webhook")
+    # ست کردن وبهوک
+    try:
+        await bot.set_webhook(
+            WEBHOOK_URL,
+            allowed_updates=["message", "channel_post", "callback_query", "chat_member"]
+        )
+        log.info("Webhook set: %s", WEBHOOK_URL)
+    except Exception as e:
+        log.exception("Failed to set webhook: %s", e)
 
-async def on_shutdown(app):
+async def on_shutdown(_app):
     log.info("Shutting down")
     try:
         await bot.delete_webhook()
@@ -471,7 +453,7 @@ app.on_startup.append(on_startup)
 app.on_cleanup.append(on_shutdown)
 
 # ----------------------------
-# Run app
+# Run
 # ----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
