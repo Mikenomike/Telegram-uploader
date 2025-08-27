@@ -1,2 +1,2 @@
 aiogram==3.10.0
-asyncpg
+aiohttp
