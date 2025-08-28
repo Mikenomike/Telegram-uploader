@@ -1,7 +1,4 @@
 aiogram==3.7.0
-fastapi==0.95.2
-uvicorn[standard]
-asyncpg==0.27.0
-python-dotenv
-httpx
-cryptography
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
