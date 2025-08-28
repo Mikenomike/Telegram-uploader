@@ -1,4 +1,7 @@
-aiogram==3.7.0
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
+aiogram==3.6.0
+fastapi==0.95.2
+uvicorn==0.23.2
+asyncpg==0.27.0
+python-multipart==0.0.9
 python-dotenv==1.0.1
+httpx==0.24.0
